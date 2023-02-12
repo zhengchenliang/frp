@@ -78,3 +78,5 @@ echo "FRP client pid is ${cli_pid}."
 x11vnc -forever -nap -ncache 10 -shared -auth guess -repeat -rfbauth /root/.vnc/passwd -rfbport ${vncp} -display :0 &
 vnc_pid=$!
 echo "VNC server pid is ${vnc_pid}."
+
+echo "Remote port for VNC: ${frp2}."

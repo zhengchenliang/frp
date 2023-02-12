@@ -16,7 +16,7 @@ done
 
 kill $(cat frpc_ssh.cur)
 killall x11vnc
-
+killall frpc
 
 
 
