@@ -1,7 +1,7 @@
 #!/bin/bash
 
 name=frps
-timi=20
+timi=3600
 pcur=$(cat ${name}.cur)
 lcur=$(cat ${name}_log.cur)
 
