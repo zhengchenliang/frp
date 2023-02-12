@@ -1,0 +1,12 @@
+frp + x11vnc remote desktop
+
+frp server (frps) takes a >1024 non-root port 45239 for frp
+frp client (frpc) dials to that port 45239
+frpc registers its service (VNC) on frps using port 45240
+frps maps server port 45240 to frpc's local port 5971
+frpc's local host runs x11vnc at port 5971
+
+so that others can dial tcp to server 45240 using a VNC viewer
+to access frpc's local host 5971 x11vnc control
+
+(reverse proxy for NAT penetration)
