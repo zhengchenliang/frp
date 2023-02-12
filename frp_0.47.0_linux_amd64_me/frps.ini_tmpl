@@ -1,0 +1,3 @@
+[common]
+bind_port = PPPP
+token = TTTT

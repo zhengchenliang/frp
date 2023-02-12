@@ -1,0 +1,11 @@
+[common]
+server_addr = SRV1
+server_port = FRP1
+token = shabiwanyier
+timeout = 20
+
+[range:VNC]
+type = tcp
+local_ip = 127.0.0.1
+local_port = VNCP
+remote_port = FRP2
