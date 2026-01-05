@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fatedier/golib/crypto"
 	quic "github.com/quic-go/quic-go"
 
 	"github.com/fatedier/frp/pkg/util/xlog"
@@ -75,9 +76,11 @@ type WrapReadWriteCloserConn struct {
 	io.ReadWriteCloser
 
 	underConn net.Conn
+
+	remoteAddr net.Addr
 }
 
-func WrapReadWriteCloserToConn(rwc io.ReadWriteCloser, underConn net.Conn) net.Conn {
+func WrapReadWriteCloserToConn(rwc io.ReadWriteCloser, underConn net.Conn) *WrapReadWriteCloserConn {
 	return &WrapReadWriteCloserConn{
 		ReadWriteCloser: rwc,
 		underConn:       underConn,
@@ -91,7 +94,14 @@ func (conn *WrapReadWriteCloserConn) LocalAddr() net.Addr {
 	return (*net.TCPAddr)(nil)
 }
 
+func (conn *WrapReadWriteCloserConn) SetRemoteAddr(addr net.Addr) {
+	conn.remoteAddr = addr
+}
+
 func (conn *WrapReadWriteCloserConn) RemoteAddr() net.Addr {
+	if conn.remoteAddr != nil {
+		return conn.remoteAddr
+	}
 	if conn.underConn != nil {
 		return conn.underConn.RemoteAddr()
 	}
@@ -125,11 +135,11 @@ type CloseNotifyConn struct {
 	// 1 means closed
 	closeFlag int32
 
-	closeFn func()
+	closeFn func(error)
 }
 
-// closeFn will be only called once
-func WrapCloseNotifyConn(c net.Conn, closeFn func()) net.Conn {
+// closeFn will be only called once with the error (nil if Close() was called, non-nil if CloseWithError() was called)
+func WrapCloseNotifyConn(c net.Conn, closeFn func(error)) *CloseNotifyConn {
 	return &CloseNotifyConn{
 		Conn:    c,
 		closeFn: closeFn,
@@ -139,12 +149,25 @@ func WrapCloseNotifyConn(c net.Conn, closeFn func()) net.Conn {
 func (cc *CloseNotifyConn) Close() (err error) {
 	pflag := atomic.SwapInt32(&cc.closeFlag, 1)
 	if pflag == 0 {
-		err = cc.Close()
+		err = cc.Conn.Close()
 		if cc.closeFn != nil {
-			cc.closeFn()
+			cc.closeFn(nil)
 		}
 	}
 	return
+}
+
+// CloseWithError closes the connection and passes the error to the close callback.
+func (cc *CloseNotifyConn) CloseWithError(err error) error {
+	pflag := atomic.SwapInt32(&cc.closeFlag, 1)
+	if pflag == 0 {
+		closeErr := cc.Conn.Close()
+		if cc.closeFn != nil {
+			cc.closeFn(err)
+		}
+		return closeErr
+	}
+	return nil
 }
 
 type StatsConn struct {
@@ -187,11 +210,11 @@ func (statsConn *StatsConn) Close() (err error) {
 }
 
 type wrapQuicStream struct {
-	quic.Stream
-	c quic.Connection
+	*quic.Stream
+	c *quic.Conn
 }
 
-func QuicStreamToNetConn(s quic.Stream, c quic.Connection) net.Conn {
+func QuicStreamToNetConn(s *quic.Stream, c *quic.Conn) net.Conn {
 	return &wrapQuicStream{
 		Stream: s,
 		c:      c,
@@ -213,6 +236,21 @@ func (conn *wrapQuicStream) RemoteAddr() net.Addr {
 }
 
 func (conn *wrapQuicStream) Close() error {
-	conn.Stream.CancelRead(0)
+	conn.CancelRead(0)
 	return conn.Stream.Close()
+}
+
+func NewCryptoReadWriter(rw io.ReadWriter, key []byte) (io.ReadWriter, error) {
+	encReader := crypto.NewReader(rw, key)
+	encWriter, err := crypto.NewWriter(rw, key)
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Writer
+	}{
+		Reader: encReader,
+		Writer: encWriter,
+	}, nil
 }

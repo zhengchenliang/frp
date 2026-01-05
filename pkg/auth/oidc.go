@@ -16,113 +16,113 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"slices"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/msg"
 )
 
-type OidcClientConfig struct {
-	// OidcClientID specifies the client ID to use to get a token in OIDC
-	// authentication if AuthenticationMethod == "oidc". By default, this value
-	// is "".
-	OidcClientID string `ini:"oidc_client_id" json:"oidc_client_id"`
-	// OidcClientSecret specifies the client secret to use to get a token in OIDC
-	// authentication if AuthenticationMethod == "oidc". By default, this value
-	// is "".
-	OidcClientSecret string `ini:"oidc_client_secret" json:"oidc_client_secret"`
-	// OidcAudience specifies the audience of the token in OIDC authentication
-	// if AuthenticationMethod == "oidc". By default, this value is "".
-	OidcAudience string `ini:"oidc_audience" json:"oidc_audience"`
-	// OidcScope specifies the scope of the token in OIDC authentication
-	// if AuthenticationMethod == "oidc". By default, this value is "".
-	OidcScope string `ini:"oidc_scope" json:"oidc_scope"`
-	// OidcTokenEndpointURL specifies the URL which implements OIDC Token Endpoint.
-	// It will be used to get an OIDC token if AuthenticationMethod == "oidc".
-	// By default, this value is "".
-	OidcTokenEndpointURL string `ini:"oidc_token_endpoint_url" json:"oidc_token_endpoint_url"`
+// createOIDCHTTPClient creates an HTTP client with custom TLS and proxy configuration for OIDC token requests
+func createOIDCHTTPClient(trustedCAFile string, insecureSkipVerify bool, proxyURL string) (*http.Client, error) {
+	// Clone the default transport to get all reasonable defaults
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 
-	// OidcAdditionalEndpointParams specifies additional parameters to be sent
-	// this field will be transfer to map[string][]string in OIDC token generator
-	// The field will be set by prefix "oidc_additional_"
-	OidcAdditionalEndpointParams map[string]string `ini:"-" json:"oidc_additional_endpoint_params"`
-}
+	// Configure TLS settings
+	if trustedCAFile != "" || insecureSkipVerify {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: insecureSkipVerify,
+		}
 
-func getDefaultOidcClientConf() OidcClientConfig {
-	return OidcClientConfig{
-		OidcClientID:                 "",
-		OidcClientSecret:             "",
-		OidcAudience:                 "",
-		OidcScope:                    "",
-		OidcTokenEndpointURL:         "",
-		OidcAdditionalEndpointParams: make(map[string]string),
+		if trustedCAFile != "" && !insecureSkipVerify {
+			caCert, err := os.ReadFile(trustedCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read OIDC CA certificate file %q: %w", trustedCAFile, err)
+			}
+
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse OIDC CA certificate from file %q", trustedCAFile)
+			}
+
+			tlsConfig.RootCAs = caCertPool
+		}
+		transport.TLSClientConfig = tlsConfig
 	}
-}
 
-type OidcServerConfig struct {
-	// OidcIssuer specifies the issuer to verify OIDC tokens with. This issuer
-	// will be used to load public keys to verify signature and will be compared
-	// with the issuer claim in the OIDC token. It will be used if
-	// AuthenticationMethod == "oidc". By default, this value is "".
-	OidcIssuer string `ini:"oidc_issuer" json:"oidc_issuer"`
-	// OidcAudience specifies the audience OIDC tokens should contain when validated.
-	// If this value is empty, audience ("client ID") verification will be skipped.
-	// It will be used when AuthenticationMethod == "oidc". By default, this
-	// value is "".
-	OidcAudience string `ini:"oidc_audience" json:"oidc_audience"`
-	// OidcSkipExpiryCheck specifies whether to skip checking if the OIDC token is
-	// expired. It will be used when AuthenticationMethod == "oidc". By default, this
-	// value is false.
-	OidcSkipExpiryCheck bool `ini:"oidc_skip_expiry_check" json:"oidc_skip_expiry_check"`
-	// OidcSkipIssuerCheck specifies whether to skip checking if the OIDC token's
-	// issuer claim matches the issuer specified in OidcIssuer. It will be used when
-	// AuthenticationMethod == "oidc". By default, this value is false.
-	OidcSkipIssuerCheck bool `ini:"oidc_skip_issuer_check" json:"oidc_skip_issuer_check"`
-}
-
-func getDefaultOidcServerConf() OidcServerConfig {
-	return OidcServerConfig{
-		OidcIssuer:          "",
-		OidcAudience:        "",
-		OidcSkipExpiryCheck: false,
-		OidcSkipIssuerCheck: false,
+	// Configure proxy settings
+	if proxyURL != "" {
+		parsedURL, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse OIDC proxy URL %q: %w", proxyURL, err)
+		}
+		transport.Proxy = http.ProxyURL(parsedURL)
+	} else {
+		// Explicitly disable proxy to override DefaultTransport's ProxyFromEnvironment
+		transport.Proxy = nil
 	}
+
+	return &http.Client{Transport: transport}, nil
 }
 
 type OidcAuthProvider struct {
-	BaseConfig
+	additionalAuthScopes []v1.AuthScope
 
 	tokenGenerator *clientcredentials.Config
+	httpClient     *http.Client
 }
 
-func NewOidcAuthSetter(baseCfg BaseConfig, cfg OidcClientConfig) *OidcAuthProvider {
+func NewOidcAuthSetter(additionalAuthScopes []v1.AuthScope, cfg v1.AuthOIDCClientConfig) (*OidcAuthProvider, error) {
 	eps := make(map[string][]string)
-	for k, v := range cfg.OidcAdditionalEndpointParams {
+	for k, v := range cfg.AdditionalEndpointParams {
 		eps[k] = []string{v}
 	}
 
-	if cfg.OidcAudience != "" {
-		eps["audience"] = []string{cfg.OidcAudience}
+	if cfg.Audience != "" {
+		eps["audience"] = []string{cfg.Audience}
 	}
 
 	tokenGenerator := &clientcredentials.Config{
-		ClientID:       cfg.OidcClientID,
-		ClientSecret:   cfg.OidcClientSecret,
-		Scopes:         []string{cfg.OidcScope},
-		TokenURL:       cfg.OidcTokenEndpointURL,
+		ClientID:       cfg.ClientID,
+		ClientSecret:   cfg.ClientSecret,
+		Scopes:         []string{cfg.Scope},
+		TokenURL:       cfg.TokenEndpointURL,
 		EndpointParams: eps,
 	}
 
-	return &OidcAuthProvider{
-		BaseConfig:     baseCfg,
-		tokenGenerator: tokenGenerator,
+	// Create custom HTTP client if needed
+	var httpClient *http.Client
+	if cfg.TrustedCaFile != "" || cfg.InsecureSkipVerify || cfg.ProxyURL != "" {
+		var err error
+		httpClient, err = createOIDCHTTPClient(cfg.TrustedCaFile, cfg.InsecureSkipVerify, cfg.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create OIDC HTTP client: %w", err)
+		}
 	}
+
+	return &OidcAuthProvider{
+		additionalAuthScopes: additionalAuthScopes,
+		tokenGenerator:       tokenGenerator,
+		httpClient:           httpClient,
+	}, nil
 }
 
 func (auth *OidcAuthProvider) generateAccessToken() (accessToken string, err error) {
-	tokenObj, err := auth.tokenGenerator.Token(context.Background())
+	ctx := context.Background()
+	if auth.httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, auth.httpClient)
+	}
+
+	tokenObj, err := auth.tokenGenerator.Token(ctx)
 	if err != nil {
 		return "", fmt.Errorf("couldn't generate OIDC token for login: %v", err)
 	}
@@ -135,7 +135,7 @@ func (auth *OidcAuthProvider) SetLogin(loginMsg *msg.Login) (err error) {
 }
 
 func (auth *OidcAuthProvider) SetPing(pingMsg *msg.Ping) (err error) {
-	if !auth.AuthenticateHeartBeats {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeHeartBeats) {
 		return nil
 	}
 
@@ -144,7 +144,7 @@ func (auth *OidcAuthProvider) SetPing(pingMsg *msg.Ping) (err error) {
 }
 
 func (auth *OidcAuthProvider) SetNewWorkConn(newWorkConnMsg *msg.NewWorkConn) (err error) {
-	if !auth.AuthenticateNewWorkConns {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeNewWorkConns) {
 		return nil
 	}
 
@@ -152,27 +152,81 @@ func (auth *OidcAuthProvider) SetNewWorkConn(newWorkConnMsg *msg.NewWorkConn) (e
 	return err
 }
 
-type OidcAuthConsumer struct {
-	BaseConfig
+type OidcTokenSourceAuthProvider struct {
+	additionalAuthScopes []v1.AuthScope
 
-	verifier         *oidc.IDTokenVerifier
-	subjectFromLogin string
+	valueSource *v1.ValueSource
 }
 
-func NewOidcAuthVerifier(baseCfg BaseConfig, cfg OidcServerConfig) *OidcAuthConsumer {
-	provider, err := oidc.NewProvider(context.Background(), cfg.OidcIssuer)
+func NewOidcTokenSourceAuthSetter(additionalAuthScopes []v1.AuthScope, valueSource *v1.ValueSource) *OidcTokenSourceAuthProvider {
+	return &OidcTokenSourceAuthProvider{
+		additionalAuthScopes: additionalAuthScopes,
+		valueSource:          valueSource,
+	}
+}
+
+func (auth *OidcTokenSourceAuthProvider) generateAccessToken() (accessToken string, err error) {
+	ctx := context.Background()
+	accessToken, err = auth.valueSource.Resolve(ctx)
+	if err != nil {
+		return "", fmt.Errorf("couldn't acquire OIDC token for login: %v", err)
+	}
+	return
+}
+
+func (auth *OidcTokenSourceAuthProvider) SetLogin(loginMsg *msg.Login) (err error) {
+	loginMsg.PrivilegeKey, err = auth.generateAccessToken()
+	return err
+}
+
+func (auth *OidcTokenSourceAuthProvider) SetPing(pingMsg *msg.Ping) (err error) {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeHeartBeats) {
+		return nil
+	}
+
+	pingMsg.PrivilegeKey, err = auth.generateAccessToken()
+	return err
+}
+
+func (auth *OidcTokenSourceAuthProvider) SetNewWorkConn(newWorkConnMsg *msg.NewWorkConn) (err error) {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeNewWorkConns) {
+		return nil
+	}
+
+	newWorkConnMsg.PrivilegeKey, err = auth.generateAccessToken()
+	return err
+}
+
+type TokenVerifier interface {
+	Verify(context.Context, string) (*oidc.IDToken, error)
+}
+
+type OidcAuthConsumer struct {
+	additionalAuthScopes []v1.AuthScope
+
+	verifier          TokenVerifier
+	subjectsFromLogin []string
+}
+
+func NewTokenVerifier(cfg v1.AuthOIDCServerConfig) TokenVerifier {
+	provider, err := oidc.NewProvider(context.Background(), cfg.Issuer)
 	if err != nil {
 		panic(err)
 	}
 	verifierConf := oidc.Config{
-		ClientID:          cfg.OidcAudience,
-		SkipClientIDCheck: cfg.OidcAudience == "",
-		SkipExpiryCheck:   cfg.OidcSkipExpiryCheck,
-		SkipIssuerCheck:   cfg.OidcSkipIssuerCheck,
+		ClientID:          cfg.Audience,
+		SkipClientIDCheck: cfg.Audience == "",
+		SkipExpiryCheck:   cfg.SkipExpiryCheck,
+		SkipIssuerCheck:   cfg.SkipIssuerCheck,
 	}
+	return provider.Verifier(&verifierConf)
+}
+
+func NewOidcAuthVerifier(additionalAuthScopes []v1.AuthScope, verifier TokenVerifier) *OidcAuthConsumer {
 	return &OidcAuthConsumer{
-		BaseConfig: baseCfg,
-		verifier:   provider.Verifier(&verifierConf),
+		additionalAuthScopes: additionalAuthScopes,
+		verifier:             verifier,
+		subjectsFromLogin:    []string{},
 	}
 }
 
@@ -181,7 +235,9 @@ func (auth *OidcAuthConsumer) VerifyLogin(loginMsg *msg.Login) (err error) {
 	if err != nil {
 		return fmt.Errorf("invalid OIDC token in login: %v", err)
 	}
-	auth.subjectFromLogin = token.Subject
+	if !slices.Contains(auth.subjectsFromLogin, token.Subject) {
+		auth.subjectsFromLogin = append(auth.subjectsFromLogin, token.Subject)
+	}
 	return nil
 }
 
@@ -190,17 +246,17 @@ func (auth *OidcAuthConsumer) verifyPostLoginToken(privilegeKey string) (err err
 	if err != nil {
 		return fmt.Errorf("invalid OIDC token in ping: %v", err)
 	}
-	if token.Subject != auth.subjectFromLogin {
+	if !slices.Contains(auth.subjectsFromLogin, token.Subject) {
 		return fmt.Errorf("received different OIDC subject in login and ping. "+
-			"original subject: %s, "+
+			"original subjects: %s, "+
 			"new subject: %s",
-			auth.subjectFromLogin, token.Subject)
+			auth.subjectsFromLogin, token.Subject)
 	}
 	return nil
 }
 
 func (auth *OidcAuthConsumer) VerifyPing(pingMsg *msg.Ping) (err error) {
-	if !auth.AuthenticateHeartBeats {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeHeartBeats) {
 		return nil
 	}
 
@@ -208,7 +264,7 @@ func (auth *OidcAuthConsumer) VerifyPing(pingMsg *msg.Ping) (err error) {
 }
 
 func (auth *OidcAuthConsumer) VerifyNewWorkConn(newWorkConnMsg *msg.NewWorkConn) (err error) {
-	if !auth.AuthenticateNewWorkConns {
+	if !slices.Contains(auth.additionalAuthScopes, v1.AuthScopeNewWorkConns) {
 		return nil
 	}
 

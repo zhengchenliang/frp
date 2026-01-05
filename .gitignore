@@ -34,9 +34,16 @@ packages/
 release/
 test/bin/
 vendor/
+lastversion/
 dist/
 .idea/
 .vscode/
+.autogen_ssh_key
+client.crt
+client.key
 
 # Cache
 *.swp
+
+# AI
+CLAUDE.md

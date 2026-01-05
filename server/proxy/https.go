@@ -15,18 +15,33 @@
 package proxy
 
 import (
+	"net"
+	"reflect"
 	"strings"
 
-	"golang.org/x/time/rate"
-
-	"github.com/fatedier/frp/pkg/config"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/util/util"
 	"github.com/fatedier/frp/pkg/util/vhost"
 )
 
+func init() {
+	RegisterProxyFactory(reflect.TypeOf(&v1.HTTPSProxyConfig{}), NewHTTPSProxy)
+}
+
 type HTTPSProxy struct {
 	*BaseProxy
-	cfg *config.HTTPSProxyConf
+	cfg *v1.HTTPSProxyConfig
+}
+
+func NewHTTPSProxy(baseProxy *BaseProxy) Proxy {
+	unwrapped, ok := baseProxy.GetConfigurer().(*v1.HTTPSProxyConfig)
+	if !ok {
+		return nil
+	}
+	return &HTTPSProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
 }
 
 func (pxy *HTTPSProxy) Run() (remoteAddr string, err error) {
@@ -44,42 +59,46 @@ func (pxy *HTTPSProxy) Run() (remoteAddr string, err error) {
 			continue
 		}
 
-		routeConfig.Domain = domain
-		l, errRet := pxy.rc.VhostHTTPSMuxer.Listen(pxy.ctx, routeConfig)
-		if errRet != nil {
-			err = errRet
-			return
+		l, err := pxy.listenForDomain(routeConfig, domain)
+		if err != nil {
+			return "", err
 		}
-		xl.Info("https proxy listen for host [%s]", routeConfig.Domain)
 		pxy.listeners = append(pxy.listeners, l)
-		addrs = append(addrs, util.CanonicalAddr(routeConfig.Domain, pxy.serverCfg.VhostHTTPSPort))
+		addrs = append(addrs, util.CanonicalAddr(domain, pxy.serverCfg.VhostHTTPSPort))
+		xl.Infof("https proxy listen for host [%s] group [%s]", domain, pxy.cfg.LoadBalancer.Group)
 	}
 
 	if pxy.cfg.SubDomain != "" {
-		routeConfig.Domain = pxy.cfg.SubDomain + "." + pxy.serverCfg.SubDomainHost
-		l, errRet := pxy.rc.VhostHTTPSMuxer.Listen(pxy.ctx, routeConfig)
-		if errRet != nil {
-			err = errRet
-			return
+		domain := pxy.cfg.SubDomain + "." + pxy.serverCfg.SubDomainHost
+		l, err := pxy.listenForDomain(routeConfig, domain)
+		if err != nil {
+			return "", err
 		}
-		xl.Info("https proxy listen for host [%s]", routeConfig.Domain)
 		pxy.listeners = append(pxy.listeners, l)
-		addrs = append(addrs, util.CanonicalAddr(routeConfig.Domain, pxy.serverCfg.VhostHTTPSPort))
+		addrs = append(addrs, util.CanonicalAddr(domain, pxy.serverCfg.VhostHTTPSPort))
+		xl.Infof("https proxy listen for host [%s] group [%s]", domain, pxy.cfg.LoadBalancer.Group)
 	}
 
-	pxy.startListenHandler(pxy, HandleUserTCPConnection)
+	pxy.startCommonTCPListenersHandler()
 	remoteAddr = strings.Join(addrs, ",")
 	return
 }
 
-func (pxy *HTTPSProxy) GetConf() config.ProxyConf {
-	return pxy.cfg
-}
-
-func (pxy *HTTPSProxy) GetLimiter() *rate.Limiter {
-	return pxy.limiter
-}
-
 func (pxy *HTTPSProxy) Close() {
 	pxy.BaseProxy.Close()
+}
+
+func (pxy *HTTPSProxy) listenForDomain(routeConfig *vhost.RouteConfig, domain string) (net.Listener, error) {
+	tmpRouteConfig := *routeConfig
+	tmpRouteConfig.Domain = domain
+
+	if pxy.cfg.LoadBalancer.Group != "" {
+		return pxy.rc.HTTPSGroupCtl.Listen(
+			pxy.ctx,
+			pxy.cfg.LoadBalancer.Group,
+			pxy.cfg.LoadBalancer.GroupKey,
+			tmpRouteConfig,
+		)
+	}
+	return pxy.rc.VhostHTTPSMuxer.Listen(pxy.ctx, &tmpRouteConfig)
 }
